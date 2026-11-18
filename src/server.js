@@ -1,5 +1,6 @@
 import { app } from './app.js';
 import { migrate } from './db/migrate.js';
+import { startSweeper } from './jobs/sweeper.js';
 
 const port = process.env.PORT || 3000;
 
@@ -11,4 +12,5 @@ app.listen(port, (err) => {
     process.exit(1);
   }
   console.log(`API jalan di http://localhost:${port}`);
+  startSweeper();
 });
