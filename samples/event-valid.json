@@ -1,0 +1,10 @@
+{
+  "name": "Konser Akustik Senja",
+  "description": "Malam musik akustik bersama band lokal",
+  "venue": "Balai Sarbini, Jakarta",
+  "startsAt": "2026-12-20T19:00:00+07:00",
+  "ticketTypes": [
+    { "name": "Reguler", "price": 100000, "quota": 100 },
+    { "name": "VIP", "price": 250000, "quota": 20 }
+  ]
+}

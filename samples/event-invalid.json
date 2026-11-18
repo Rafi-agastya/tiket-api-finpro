@@ -1,0 +1,5 @@
+{
+  "name": "Event Cacat",
+  "startsAt": "2026-12-20T19:00:00+07:00",
+  "ticketTypes": [{ "name": "Reguler", "price": 100000, "quota": 100 }]
+}
