@@ -1,0 +1,1 @@
+export const ORDER_TTL_SECONDS = Number(process.env.ORDER_TTL_SECONDS ?? 900);  

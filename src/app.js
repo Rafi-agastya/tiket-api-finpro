@@ -2,6 +2,8 @@ import express from 'express';
 import { pool } from './db/pool.js';
 import { eventsRouter } from './routes/events.js';
 import { HttpError } from './errors.js';
+import { usersRouter } from './routes/users.js';
+import { ordersRouter } from './routes/orders.js';
 
 export const app = express();
 
@@ -18,6 +20,8 @@ app.get('/health', async (req, res) => {
 });
 
 app.use('/events', eventsRouter);
+app.use('/users', usersRouter);
+app.use('/orders', ordersRouter);
 
 app.use((req, res) => {
   res.status(404).json({ error: 'Rute tidak ditemukan' });
