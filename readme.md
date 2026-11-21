@@ -1,84 +1,184 @@
-# Keputusan Desain dan Trade-off
+# API Penjualan Tiket Event (Kuota Terbatas)
 
-## 1. Menjaga kuota tetap benar (inti sistem)
+Backend untuk menjual tiket event dengan kuota terbatas. Dibangun dengan Node.js 24, Express 5, dan PostgreSQL 16. Pembayaran disimulasikan, dengan dua cara menandainya lunas: endpoint langsung dan webhook.
 
-**Keputusan.** Setiap tipe tiket punya kolom `quota` dan `held` (jumlah yang sedang ditahan oleh pesanan `PENDING` dan `PAID`). Sisa kuota = `quota - held`. Memesan dilakukan dengan satu pernyataan:
+## Menjalankan (satu perintah)
 
-```sql
-UPDATE ticket_types SET held = held + $qty
- WHERE id = $id AND held + $qty <= quota
+Syarat: Docker dan Docker Compose.
+
+```bash
+docker compose up --build
 ```
 
-Jika tidak ada baris yang terpengaruh, kuota tidak cukup dan pesanan ditolak (409).
+API tersedia di `http://localhost:3000`. Migrasi database berjalan otomatis saat API start. Cek dengan `GET /health`.
 
-**Alasan.** Pola "baca sisa, cek, lalu ubah" rawan race condition: dua request membaca sisa 1, keduanya lolos, dan tiket terjual dua kali. Dengan satu `UPDATE` bersyarat, PostgreSQL mengunci baris tersebut sehingga request yang datang bersamaan antre dan kondisinya dinilai ulang dengan nilai terbaru.
+Untuk berhenti: `docker compose down`. Untuk menghapus data juga: `docker compose down -v`.
 
-**Lapisan kedua.** Constraint `CHECK (held >= 0 AND held <= quota)` di database. Kalau kode aplikasi punya bug, database tetap menolak oversell. (Saat kondisi di `UPDATE` sengaja dihapus untuk latihan, test gagal dengan 500, bukan karena tiket berlebih terjual.)
+### Memakai image dari registry
 
-**Alternatif yang dipertimbangkan.**
-- `SELECT ... FOR UPDATE` lalu hitung `COUNT` pesanan: benar, tapi lebih lambat dan lebih banyak langkah.
-- Menghitung sisa dari tabel pesanan setiap kali: tidak ada angka yang bisa tidak sinkron, tapi query membesar seiring jumlah pesanan.
-- Redis atau antrean: menambah infrastruktur yang tidak diperlukan untuk skala soal ini.
+Setiap push menghasilkan image bertag commit di GitHub Container Registry:
 
-**Yang dikorbankan.** `held` adalah data turunan: harus selalu diperbarui bersama perubahan status pesanan. Itu dijaga dengan melakukannya dalam transaksi yang sama, dan diuji oleh pemeriksaan invarian di setiap test.
+```
+ghcr.io/rafi-agastya/tiket-api-finpro:sha-<7 karakter commit>
+ghcr.io/rafi-agastya/tiket-api-finpro:latest
+```
 
-**Bukti.** 200 pesanan bersamaan untuk kuota 100 berakhir dengan tepat 100 terjual dan 100 ditolak (lihat README).
+## Mencoba alur lengkap
 
-## 2. Batas 4 tiket per pembeli per event
+Contoh berikut memakai file di `samples/` dan mengasumsikan database baru (`docker compose down -v` lalu `up`), sehingga tipe tiket Reguler berid `1`, VIP berid `2`, dan pesanan pertama berid `1`. Kalau databasenya sudah berisi data, ambil id dari respons masing-masing langkah. Di Windows PowerShell, gunakan `curl.exe`, bukan `curl`.
 
-**Keputusan.** Sebelum menahan kuota, transaksi mengambil `pg_advisory_xact_lock` berdasarkan kombinasi (event, pembeli), lalu menghitung jumlah tiket pada pesanan `PENDING` dan `PAID` milik pembeli itu di event tersebut.
+```bash
+# 1. Buat event (Reguler kuota 100, VIP kuota 20)
+curl -X POST http://localhost:3000/events -H "Content-Type: application/json" --data "@samples/event-valid.json"
 
-**Alasan.** Batas ini dihitung dari banyak baris pesanan, jadi tidak bisa dijaga oleh satu `UPDATE`. Tanpa kunci, dua request paralel dari pembeli yang sama (masing-masing 3 tiket) sama-sama menghitung "sudah punya 0" dan keduanya lolos, sehingga totalnya 6. Kunci hanya mengantrikan request pembeli yang sama di event yang sama, pembeli lain tetap berjalan paralel. Kunci dilepas otomatis saat transaksi selesai.
+# 2. Buat pembeli (dapat id 1)
+curl -X POST http://localhost:3000/users -H "Content-Type: application/json" --data "@samples/user.json"
 
-**Yang dikorbankan.** Request beruntun dari pembeli yang sama diproses satu per satu (tidak masalah, wajar). Dua kombinasi berbeda secara teori bisa memakai nomor kunci yang sama (tabrakan hash), akibatnya hanya menunggu sedikit lebih lama, bukan hasil yang salah. Batas berlaku per event, bukan per tipe tiket.
+# 3. Pesan 2 tiket Reguler (status PENDING, menahan kuota 15 menit)
+curl -X POST http://localhost:3000/orders -H "Content-Type: application/json" -H "X-Buyer-Id: 1" --data "@samples/order-reguler-2.json"
 
-## 3. Kedaluwarsa 15 menit
+# 4. Tandai lunas (simulasi pembayaran), tiket terbit.
+#    Pilih SALAH SATU: langsung lewat endpoint...
+curl -X POST http://localhost:3000/orders/1/pay -H "X-Buyer-Id: 1"
+#    ...atau lewat webhook seperti penyedia sungguhan
+curl -X POST http://localhost:3000/webhooks/payment -H "Content-Type: application/json" --data "@samples/webhook-paid.json"
 
-**Keputusan.** Dua lapis:
-1. Saat membayar, kondisi `expires_at > now()` menolak pesanan yang sudah lewat waktu, bahkan jika belum disapu.
-2. Sweeper di dalam proses API berjalan tiap 15 detik, mengubah pesanan `PENDING` yang sudah lewat waktu menjadi `EXPIRED`, dan mengembalikan kuotanya dalam transaksi yang sama. Memakai `FOR UPDATE SKIP LOCKED` sehingga aman jika ada lebih dari satu instance.
+# 5. Lihat riwayat pesanan dan tiket
+curl http://localhost:3000/orders -H "X-Buyer-Id: 1"
+```
 
-**Alasan.** Lapisan pertama menjamin kebenaran (pembayaran terlambat tidak pernah lolos), lapisan kedua menjamin kuota akhirnya kembali. Waktu memakai `now()` milik database, bukan jam server aplikasi, sehingga konsisten.
+## Cara menandai pesanan lunas
 
-**Alternatif.** Timer per pesanan di memori hilang saat server restart. Penjadwal terpisah (cron atau antrean pekerjaan) menambah infrastruktur. Mengandalkan pengecekan saat dibaca saja membuat `held` tidak akurat.
+Ada dua cara, dan keduanya berujung pada logika pelunasan yang sama.
 
-**Yang dikorbankan.** Kuota pesanan kedaluwarsa bisa tertahan hingga sekitar 15 detik setelah batas waktu. Dalam rentang itu pesanan tersebut juga masih dihitung pada batas 4 tiket. Itu kompromi sederhana yang diterima.
+**1. Endpoint langsung**
 
-## 4. Siklus status dan idempotensi
+```
+POST /orders/:id/pay      (header X-Buyer-Id: <id pembeli>)
+```
 
-**Keputusan.** Status pesanan: `PENDING` menjadi `PAID`, `CANCELLED`, atau `EXPIRED`. Semua perpindahan memakai pola `UPDATE ... WHERE status = 'PENDING'` dan hanya perpindahan yang berhasil yang menjalankan efek sampingnya (menerbitkan tiket atau mengembalikan kuota).
+Hanya pesanan berstatus `PENDING` yang belum lewat 15 menit yang bisa dilunasi. Memanggil endpoint ini dua kali aman: tiket tidak diterbitkan ulang dan responsnya sama.
 
-**Alasan.** Jika bayar dan batal, atau bayar dan sweeper, bertabrakan, hanya satu yang menang. Yang kalah melihat status sudah berubah. Karena itu kuota kembali tepat sekali, dan tiket terbit tepat sekali.
+**2. Webhook** (lihat bagian "Webhook pembayaran" di bawah)
 
-**Idempoten.** Membayar pesanan yang sudah lunas membalas 200 dengan tiket yang sama. Membatalkan pesanan yang sudah batal juga membalas 200. Klien aman mengulang request jika koneksi putus.
+```
+POST /webhooks/payment
+```
 
-**Pengaman tambahan.** `UNIQUE (order_id, seq)` dan `UNIQUE (code)` di tabel tiket mencegah tiket ganda walau ada bug. Penerbitan tiket dan perubahan status berada dalam satu transaksi, jadi tidak mungkin ada pesanan lunas tanpa tiket.
+## Webhook pembayaran (idempoten)
 
-## 5. PostgreSQL dan SQL langsung (tanpa ORM)
+Hasil pembayaran juga bisa diterima lewat webhook seperti penyedia sungguhan:
 
-PostgreSQL dipilih karena punya transaksi, penguncian baris, dan constraint yang menjadi dasar penjagaan kuota. SQL ditulis langsung dengan driver `pg` supaya logika kuota terlihat jelas dan bisa dijelaskan, tidak tersembunyi di balik ORM. Nilai selalu dikirim sebagai parameter (`$1`, `$2`) sehingga aman dari SQL injection. Biayanya: lebih banyak kode manual dan tidak ada pemeriksaan tipe otomatis.
+```bash
+curl -X POST http://localhost:3000/webhooks/payment -H "Content-Type: application/json" --data "@samples/webhook-paid.json"
+```
 
-## 6. Penyederhanaan yang disengaja
+Body: `{ "eventId": "<id unik pesan>", "orderId": 1, "status": "paid" }`. Nilai `status` yang diterima: `paid` atau `failed`. Hasil (`outcome`) dan perilakunya:
 
-- **Satu pesanan satu tipe tiket.** Pembeli yang ingin Reguler dan VIP membuat dua pesanan. Menghindari tabel item pesanan. Batas 4 tiket tetap dihitung lintas tipe.
-- **Identitas pembeli seadanya** lewat header `X-Buyer-Id`. Siapa pun bisa berpura-pura menjadi pembeli lain. Otentikasi tidak dinilai pada soal ini.
-- **Pembayaran disimulasikan** lewat `POST /orders/:id/pay`. Pembayaran setelah kedaluwarsa ditolak (409) dan tidak ada konsep refund.
-- **Konsistensi event dan tipe tiket pada pesanan** dijaga di kode, bukan constraint database.
-- **Kode tiket** berupa 6 byte acak (48 bit). Peluang bentrok sangat kecil, dan constraint `UNIQUE` menolaknya jika terjadi.
+| Kondisi | Hasil |
+|---|---|
+| Pesanan `PENDING`, belum lewat waktu | `PAID_NOW`, tiket terbit |
+| `eventId` yang sama dikirim lagi | `duplicate: true`, diabaikan |
+| Pesanan sudah lunas | `ALREADY_PAID`, tidak ada tiket baru |
+| Pesanan sudah kedaluwarsa atau dibatalkan | `LATE`, tidak ada tiket |
+| Pesanan tidak dikenal | `NOT_FOUND`, dicatat |
 
-## 7. Pool koneksi
+Endpoint membalas 200 untuk semua kondisi bisnis di atas, dan 400 hanya untuk body yang salah bentuk. Setiap `eventId` hanya diproses satu kali, jadi untuk mencoba ulang dengan pesanan lain, ganti `eventId` pada `samples/webhook-paid.json`.
 
-Pool dinaikkan menjadi maksimum 20 koneksi dengan batas tunggu 10 detik. Dengan bawaan (10 koneksi dan 3 detik), pada lonjakan 200 request sebagian bisa gagal karena kehabisan waktu menunggu koneksi, padahal logikanya benar. Antre sebentar dipilih daripada gagal cepat.
+## Endpoint
 
-## 8. Docker dan CI/CD
+| Method | Path | Keterangan |
+|---|---|---|
+| GET | `/health` | Cek API dan database |
+| POST | `/events` | Buat event beserta tipe Reguler dan VIP (kuota dan harga masing-masing) |
+| GET | `/events`, `/events/:id` | Lihat event dan sisa kuota per tipe |
+| POST | `/users` | Buat pembeli |
+| POST | `/orders` | Pesan 1 sampai 4 tiket. Body: `{ "ticketTypeId": 1, "qty": 2 }` |
+| GET | `/orders`, `/orders/:id` | Riwayat pesanan beserta tiketnya |
+| POST | `/orders/:id/pay` | Tandai lunas dan terbitkan tiket |
+| POST | `/orders/:id/cancel` | Batalkan sebelum bayar, kuota langsung kembali |
+| POST | `/webhooks/payment` | Terima hasil pembayaran dari penyedia (idempoten) |
 
-- Migrasi berjalan otomatis saat API start, dilindungi advisory lock sehingga dua instance tidak bermigrasi bersamaan. Hasilnya satu perintah (`docker compose up --build`) cukup untuk menyalakan seluruh sistem.
-- API menunggu database sehat sebelum start (`depends_on` dengan `service_healthy`).
-- Image ditag dengan commit (`sha-xxxxxxx`) supaya jelas versi mana yang berjalan, `latest` hanya alias tambahan. Image hanya dibuat jika test lolos (`needs: test`).
-- Test integrasi memakai PostgreSQL sungguhan, bukan mock, karena yang paling rawan salah adalah perilaku database. Test menolak berjalan di database yang namanya tidak berakhiran `_test`.
+Semua endpoint `/orders` memerlukan header `X-Buyer-Id`. Identifikasi pembeli ini sengaja sederhana (otentikasi tidak dinilai).
 
-## 9. Tidak dikerjakan
+Kode status: `400` input salah, `401` pembeli tidak dikenal, `404` tidak ditemukan, `409` kuota habis atau status tidak mengizinkan, `422` melewati batas 4 tiket per event.
 
-- **Webhook pembayaran idempoten** dan **frontend** tidak dikerjakan karena keterbatasan waktu. Keduanya opsional.
-- Jika webhook dibuat: simpan `provider_event_id` dengan constraint `UNIQUE` untuk mengabaikan pesan ganda, dan pesan yang datang setelah pesanan kedaluwarsa dicatat tanpa menerbitkan tiket.
-- Daftar event belum dipaginasi. Sweeper berjalan dalam proses API (cukup untuk skala ini, dan aman untuk beberapa instance berkat `SKIP LOCKED`, namun belum diuji dengan banyak instance).git add .
+## Menjalankan test
+
+Syarat: Node.js 24 dan database container berjalan.
+
+```bash
+docker compose up -d db
+npm ci
+npm test
+```
+
+Test memakai database terpisah `tiket_test` (dibuat otomatis oleh `docker/initdb`). Test menolak berjalan jika nama database tidak berakhiran `_test`. Ada 12 test integrasi (HTTP dan PostgreSQL sungguhan), dengan skenario:
+
+- alur pesan, bayar, sampai tiket terbit
+- bayar dua kali tidak menerbitkan tiket dua kali
+- kuota habis, tidak ada oversell
+- batas 4 tiket per pembeli per event (lintas tipe)
+- batal mengembalikan kuota tepat sekali
+- pesanan kedaluwarsa tidak bisa dibayar dan kuotanya kembali
+- validasi input dan pesanan milik orang lain
+- webhook yang sama terkirim dua kali, atau dua pesan identik bersamaan, tidak menerbitkan tiket dua kali
+- webhook untuk pesanan yang sudah lunas, kedaluwarsa, atau tidak dikenal ditangani tanpa efek samping
+
+Setiap test diakhiri pemeriksaan invarian: jumlah kuota yang ditahan sama dengan jumlah tiket pada pesanan aktif, dan tiket hanya ada untuk pesanan lunas sebanyak jumlah pesanannya.
+
+## Uji 200 pesanan bersamaan
+
+```bash
+docker compose up --build -d
+npm run loadtest
+```
+
+Skrip membuat event berkuota 100, lalu mengirim 200 pesanan sekaligus dari 200 pembeli berbeda. Hasil yang kami peroleh:
+
+```
+201 Created  : 100
+409 Conflict : 100
+Lainnya      : 0
+Sisa kuota   : 0
+Waktu        : 400 ms
+
+HASIL: LULUS (tepat 100 terjual, tidak ada oversell)
+```
+
+Pemeriksaan langsung di database setelahnya: `quota = 100`, `held = 100`.
+
+## CI/CD
+
+GitHub Actions (`.github/workflows/ci.yml`) pada setiap push:
+
+1. Menjalankan test dengan PostgreSQL sungguhan.
+2. Jika lolos, membangun image Docker dan mengunggahnya ke `ghcr.io` dengan tag `sha-<commit>` (dan `latest` untuk branch `main`).
+
+Jika test gagal, image tidak dibuat.
+
+## Konfigurasi
+
+Lihat `.env.example`. Hanya `DATABASE_URL` dan `PORT` yang perlu untuk menjalankan lokal tanpa Docker (`npm run dev`).
+
+| Variabel | Bawaan | Keterangan |
+|---|---|---|
+| `PORT` | 3000 | Port API |
+| `DATABASE_URL` | - | Connection string PostgreSQL |
+| `ORDER_TTL_SECONDS` | 900 | Lama pesanan menahan kuota (15 menit) |
+| `SWEEP_INTERVAL_SECONDS` | 15 | Jeda pembatalan otomatis pesanan kedaluwarsa |
+
+## Struktur
+
+```
+src/        routes/ (HTTP), services/ (logika bisnis), db/, jobs/ (sweeper), middleware/
+migrations/ file SQL berurutan (001 skema utama, 002 tabel webhook)
+test/       test integrasi
+scripts/    uji konkurensi
+samples/    contoh body request
+docker/     skrip inisialisasi database
+```
+
+Keputusan desain dan trade-off ada di [DECISIONS.md](DECISIONS.md).
+
+Catatan: proyek ini tidak menyertakan frontend (opsional pada soal).

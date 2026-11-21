@@ -7,7 +7,7 @@
     "dev": "node --watch --env-file=.env src/server.js",
     "start": "node src/server.js",
     "migrate": "node --env-file=.env src/db/migrate-cli.js",
-    "test": "node --env-file=.env.test --test --test-concurrency=1 test/orders.test.js",
+    "test": "node --env-file=.env.test --test --test-concurrency=1 test/orders.test.js test/webhook.test.js",
     "loadtest": "node scripts/concurrency-test.js"
   },
   "keywords": [],

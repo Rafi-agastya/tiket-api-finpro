@@ -50,7 +50,7 @@ Jika tidak ada baris yang terpengaruh, kuota tidak cukup dan pesanan ditolak (40
 
 **Alasan.** Jika bayar dan batal, atau bayar dan sweeper, bertabrakan, hanya satu yang menang. Yang kalah melihat status sudah berubah. Karena itu kuota kembali tepat sekali, dan tiket terbit tepat sekali.
 
-**Idempoten.** Membayar pesanan yang sudah lunas membalas 200 dengan tiket yang sama. Membatalkan pesanan yang sudah batal juga membalas 200. Klien aman mengulang request jika koneksi putus.
+**Idempoten.** Membayar pesanan yang sudah lunas membalas 200 dengan tiket yang sama. Membatalkan pesanan yang sudah batal juga membalas 200. Klien aman mengulang request jika koneksi putus. Jalur webhook (bagian 10) memakai pola status yang sama, jadi pesan pembayaran yang datang berulang atau terlambat tidak bisa menerbitkan tiket dua kali.
 
 **Pengaman tambahan.** `UNIQUE (order_id, seq)` dan `UNIQUE (code)` di tabel tiket mencegah tiket ganda walau ada bug. Penerbitan tiket dan perubahan status berada dalam satu transaksi, jadi tidak mungkin ada pesanan lunas tanpa tiket.
 
@@ -62,7 +62,7 @@ PostgreSQL dipilih karena punya transaksi, penguncian baris, dan constraint yang
 
 - **Satu pesanan satu tipe tiket.** Pembeli yang ingin Reguler dan VIP membuat dua pesanan. Menghindari tabel item pesanan. Batas 4 tiket tetap dihitung lintas tipe.
 - **Identitas pembeli seadanya** lewat header `X-Buyer-Id`. Siapa pun bisa berpura-pura menjadi pembeli lain. Otentikasi tidak dinilai pada soal ini.
-- **Pembayaran disimulasikan** lewat `POST /orders/:id/pay`. Pembayaran setelah kedaluwarsa ditolak (409) dan tidak ada konsep refund.
+- **Pembayaran disimulasikan** lewat `POST /orders/:id/pay` atau webhook. Pembayaran setelah kedaluwarsa ditolak dan tidak ada konsep refund.
 - **Konsistensi event dan tipe tiket pada pesanan** dijaga di kode, bukan constraint database.
 - **Kode tiket** berupa 6 byte acak (48 bit). Peluang bentrok sangat kecil, dan constraint `UNIQUE` menolaknya jika terjadi.
 
@@ -77,9 +77,22 @@ Pool dinaikkan menjadi maksimum 20 koneksi dengan batas tunggu 10 detik. Dengan 
 - Image ditag dengan commit (`sha-xxxxxxx`) supaya jelas versi mana yang berjalan, `latest` hanya alias tambahan. Image hanya dibuat jika test lolos (`needs: test`).
 - Test integrasi memakai PostgreSQL sungguhan, bukan mock, karena yang paling rawan salah adalah perilaku database. Test menolak berjalan di database yang namanya tidak berakhiran `_test`.
 
-
 ## 9. Tidak dikerjakan
 
-- **Webhook pembayaran idempoten** dan **frontend** tidak dikerjakan karena keterbatasan waktu. Keduanya opsional.
-- Jika webhook dibuat: simpan `provider_event_id` dengan constraint `UNIQUE` untuk mengabaikan pesan ganda, dan pesan yang datang setelah pesanan kedaluwarsa dicatat tanpa menerbitkan tiket.
+- **Frontend** tidak dikerjakan karena keterbatasan waktu (opsional pada soal).
 - Daftar event belum dipaginasi. Sweeper berjalan dalam proses API (cukup untuk skala ini, dan aman untuk beberapa instance berkat `SKIP LOCKED`, namun belum diuji dengan banyak instance).
+
+## 10. Webhook pembayaran idempoten
+
+**Keputusan.** `POST /webhooks/payment` mencatat setiap pesan di tabel `payment_events` dengan `provider_event_id` yang `UNIQUE`, memakai `INSERT ... ON CONFLICT DO NOTHING`. Pesan dengan ID yang sudah ada diabaikan (200, `duplicate: true`). Pesan baru dijalankan lewat logika pelunasan yang sama dengan `/pay`, dalam satu transaksi dengan pencatatannya.
+
+**Tiga skenario.**
+- *Terkirim dua kali:* ID yang sama dikenali dan diabaikan. Untuk dua pesan identik yang datang bersamaan, `INSERT` kedua menunggu transaksi pertama selesai, lalu mendapat konflik. Jadi constraint `UNIQUE` melindungi dari pengulangan sekaligus dari balapan.
+- *Terlambat (pesanan sudah lunas):* `UPDATE ... WHERE status = 'PENDING'` tidak mengubah apa pun, tiket tidak terbit lagi (`ALREADY_PAID`).
+- *Tiba setelah kedaluwarsa:* `expires_at > now()` dan status `EXPIRED` menolak, kejadian dicatat dengan hasil `LATE` untuk ditindaklanjuti manual.
+
+**Selalu membalas 200** untuk kondisi bisnis (duplikat, terlambat, tidak dikenal), karena penyedia pembayaran sungguhan mengirim ulang terus-menerus jika menerima status error. Hanya input yang salah bentuk yang dibalas 400.
+
+**Yang dikorbankan.** Keaslian pengirim tidak diverifikasi (penyedia sungguhan menandatangani pesan, misalnya dengan HMAC). Tidak ada proses refund otomatis untuk hasil `LATE`. Logika pelunasan ditulis ulang di `markPaidBySystem` dan belum dipakai bersama oleh `payOrder`, supaya `payOrder` yang sudah teruji tidak diubah.
+
+**Bukti.** Lima test otomatis (`test/webhook.test.js`) memeriksa pesan ganda, dua pesan identik bersamaan, webhook setelah pesanan lunas, webhook setelah kedaluwarsa, dan pesanan tidak dikenal.

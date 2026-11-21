@@ -23,7 +23,7 @@ export async function setupDb() {
 export async function resetDb() {
   assertTestDb();
   await pool.query(
-    'TRUNCATE tickets, orders, ticket_types, events, users RESTART IDENTITY CASCADE',
+    'TRUNCATE tickets, orders, ticket_types, events, users, payment_events RESTART IDENTITY CASCADE',
   );
 }
 

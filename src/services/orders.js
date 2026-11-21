@@ -185,6 +185,34 @@ export async function payOrder(buyerId, orderId) {
   return getOrder(buyerId, orderId);
 }
 
+export async function markPaidBySystem(client, orderId) {
+  const { rows } = await client.query(
+    `UPDATE orders
+        SET status = 'PAID', paid_at = now()
+      WHERE id = $1 AND status = 'PENDING' AND expires_at > now()
+      RETURNING qty`,
+    [orderId],
+  );
+
+  if (rows.length === 1) {
+    for (let seq = 1; seq <= rows[0].qty; seq++) {
+      await client.query(
+        'INSERT INTO tickets (order_id, seq, code) VALUES ($1, $2, $3)',
+        [orderId, seq, generateTicketCode()],
+      );
+    }
+    return 'PAID_NOW';
+  }
+
+  const { rows: current } = await client.query(
+    'SELECT status FROM orders WHERE id = $1',
+    [orderId],
+  );
+  if (current.length === 0) return 'NOT_FOUND';
+  if (current[0].status === 'PAID') return 'ALREADY_PAID';
+  return 'LATE';
+}
+
 export async function cancelOrder(buyerId, orderId) {
   await withTransaction(async (client) => {
     const { rows } = await client.query(

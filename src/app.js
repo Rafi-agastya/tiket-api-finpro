@@ -4,6 +4,7 @@ import { eventsRouter } from './routes/events.js';
 import { HttpError } from './errors.js';
 import { usersRouter } from './routes/users.js';
 import { ordersRouter } from './routes/orders.js';
+import { webhooksRouter } from './routes/webhooks.js';
 
 export const app = express();
 
@@ -22,6 +23,7 @@ app.get('/health', async (req, res) => {
 app.use('/events', eventsRouter);
 app.use('/users', usersRouter);
 app.use('/orders', ordersRouter);
+app.use('/webhooks', webhooksRouter);
 
 app.use((req, res) => {
   res.status(404).json({ error: 'Rute tidak ditemukan' });
